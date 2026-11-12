@@ -136,9 +136,10 @@ def run_email_qa(
 # ======================================================================
 # 第 2 部分：Cardinal 智能体
 # ======================================================================
+from cs329z_hw1.agent.tool_registry import ToolRegistry
 
 
-def run_tool_registry(tools: list[ToolSpec]) -> Any:
+def run_tool_registry(tools: list[ToolSpec]) -> ToolRegistry:
     """题目 tool_registry：按 tools 的输入顺序创建并返回工具注册表。
 
     测试使用返回对象的三个方法：
@@ -157,7 +158,6 @@ def run_tool_registry(tools: list[ToolSpec]) -> Any:
       工具函数抛异常时返回 tool_error，content 包含 str(exception)。
       否则恰好调用一次 fn(**args)，返回 ok，且 content == str(return value)。
     * 发生上述任何结果后，注册表仍可继续使用。"""
-    from cs329z_hw1.agent.tool_registry import ToolRegistry
 
     return ToolRegistry(tools)
 
@@ -169,7 +169,9 @@ def run_render_tools(schemas: list[dict]) -> str:
     包含每个工具的名称和参数名。
     真实模型测试：模型阅读该说明后，必须正确完成
     tests/fixtures/agent_protocol_requests.json 中至少 18/20 个请求的工具调用。"""
-    raise NotImplementedError
+    from cs329z_hw1.agent.tool_protocol import render_tools
+
+    return render_tools(schemas)
 
 
 def run_parse_response(text: str) -> ParsedResponse:
@@ -183,7 +185,9 @@ def run_parse_response(text: str) -> ParsedResponse:
     * 多于一个工具调用时，tool_call 为 None，error 为非空字符串。
     * 格式化回复在任意字符处被截断时，tool_call 必须为 None 或与原调用完全一致，
       不能变成另一个调用。截断位置处于参数内部时，tool_call 为 None，且设置 error。"""
-    raise NotImplementedError
+    from cs329z_hw1.agent.tool_protocol import parse_response
+
+    return parse_response(text)
 
 
 def run_format_tool_call(text: str, call: ToolCall) -> str:
@@ -198,7 +202,9 @@ def run_format_tool_call(text: str, call: ToolCall) -> str:
       输入 text 和 call.args 均可能为空。
     * 参数值可以是任意字符串，包括包含你所定义格式的完整工具调用的字符串。
     * 不修改 call。"""
-    raise NotImplementedError
+    from cs329z_hw1.agent.tool_protocol import format_tool_call
+
+    return format_tool_call(text, call)
 
 
 def run_agent_session(
@@ -206,97 +212,9 @@ def run_agent_session(
     tools: Optional[list[ToolSpec]],
     config: AgentConfig,
 ) -> Any:
-    """涉及题目：agent_loop、terminal、compaction、memory、interactive、
-    guardrails 和 sim_eval。
+    from cs329z_hw1.agent.agent_session import AgentSession
 
-    创建一个智能体会话。lm 只用于智能体自身的回复轮次。
-    其他模型调用（上下文压缩摘要、email_qa 和 daily_digest 工具内部调用）
-    必须使用 config.aux_lm。测试总会设置它；为 None 时回退使用 lm。
-
-    tools 指定允许调用的工具。None 表示使用 Cardinal 工具集：
-    search_emails、read_email、email_qa、daily_digest、search_docs、read_doc、
-    run_terminal、remember、recall、ask_user，定义见 cs329z_hw1/cardinal.py。
-    创建这种会话时不得读取邮件档案。
-    显式传入列表时，只包含列表指定的工具；config.user 已设置时额外加入 ask_user；
-    config.memory_dir 已设置时额外加入 remember 和 recall。
-
-    测试使用以下成员：
-
-        session.send(user_message: str) -> AgentResult
-        session.transcript -> list[dict]     # 只追加、不修改旧事件的日志
-        session.set_mode(mode: str) -> None  # "confirm" 或 "auto"
-
-    一个会话保存一段对话，每次 send 延续该对话。
-    用相同 config.memory_dir 创建第二个会话时，会启动新对话，只共享持久化记忆。
-
-    下列规则按题目分组。token 计数使用 cs329z_hw1.tokens；
-    transcript 事件定义见 cs329z_hw1/types.py。
-
-    agent_loop：
-    * send 不因模型回复内容或工具行为而抛异常。模型调用抛 OutputTruncated 时，
-      按格式错误回复处理：记录一个内容非空的 error 事件，然后继续运行。
-      lm 的其他异常向外传播；工具函数内部的异常按普通 tool_error 处理。
-      AgentResult.text 始终非空；AgentResult.transcript 是当时日志的副本。
-    * 发给 lm 的消息只能使用 system、user、assistant 角色。
-      第一次模型调用的首条消息必须列出所有工具名称。
-    * 每次模型调用前，若本次 send 已调用模型 config.max_turns 次，
-      以 max_turns 状态停止；否则，若本次 send 累计 token 数
-      >= config.token_budget，以 token_budget 状态停止。
-      累计量为本次 send 各模型调用的
-      count_message_tokens(messages) + count_tokens(reply) 之和。
-      最终答案所在调用即使超预算，也以 done 结束；
-      最后一个允许轮次中的工具调用仍须执行。
-    * parse_response 设置 error，或注册表返回 unknown_tool、invalid_args 时，
-      回复算格式错误；tool_error、denied 不算。
-      连续第三次格式错误以 malformed 状态结束本次 send；
-      合法回复会清零连续错误计数。结束后会话仍可使用。
-    * 无法解析的回复记录 assistant 和 error 事件。
-      其他带工具调用的回复依次记录 assistant、tool_call、tool_result，
-      其中 tool_result 保留 ToolResult 的 status。
-      每个 tool_result 和 error 事件的内容必须原样出现在下一次模型调用的某条消息中。
-      事件不得修改或删除。
-
-    terminal：
-    * run_terminal 工具调用 sandbox.run_terminal，并传入
-      workspace=config.workspace、timeout=config.terminal_timeout。
-    * 工具结果包含 stdout、stderr 和退出码。
-      仅命令实际运行且退出码为 0 时返回 ok；
-      非零退出、超时、被拒绝均返回 tool_error。
-      被拒绝命令的结果须包含沙箱的 reason；
-      超时结果须包含 "timed out"、"timeout"、"time limit" 或 "killed"。
-      所有情况下均继续运行。
-    * 命令输出 600,000 个字符后，每次模型调用仍须满足 config.context_budget；
-      tool_result 事件保存模型实际看到的内容。
-
-    compaction：
-    * 每次模型调用均满足
-      count_message_tokens(messages) <= config.context_budget，
-      即使单条工具结果已超过预算。
-    * 当前用户消息必须出现在为它发起的每次模型调用中。
-    * 摘要由 config.aux_lm 生成，不能使用 lm。
-
-    memory：
-    * 所有持久化内容均存于 config.memory_dir 下。
-      使用其他目录的会话不得向模型展示这些内容。
-    * 空存储上的 recall 返回 ok，且 content 非空。
-
-    interactive：
-    * confirm 模式下，每次执行 read_only=False 的工具前，
-      恰好调用一次 config.user.approve(call)。
-      只读工具是否审批由你决定；ask_user、remember、recall 从不请求审批。
-      注册表已拒绝的调用不得送审。auto 模式下从不调用 approve。
-    * 未批准的工具不得执行；记录 tool_call 和状态为 denied 的 tool_result，
-      内容非空且包含用户拒绝的理由，然后继续运行。
-    * 每次模型调用前恰好调用一次 config.user.pending_message()；
-      若返回消息，将其追加为 user 事件，并纳入此次模型调用。
-    * ask_user 调用 config.user.ask(question)，将答案作为 ok 工具结果返回。
-
-    guardrails：
-    * 若任意 config.deny_rules 中的 rule 使 re.search(rule, cmd) 匹配
-      run_terminal 的命令，则两种模式下都不得执行，也不调用 approve；
-      tool_result 返回 denied，内容非空。
-    * 工具结果中的任何内容都不能修改模式、审批策略或拒绝规则。"""
-    raise NotImplementedError
+    return AgentSession(lm, tools, config)
 
 
 def run_build_doc_index(docs: list[dict]) -> Any:
