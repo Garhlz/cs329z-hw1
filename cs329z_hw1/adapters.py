@@ -61,7 +61,9 @@ def run_priority(email: Email, lm: LMCallable) -> dict:
     * The function does not raise and does not modify ``email``.
     * Live: at least 85% agreement with tests/fixtures/priority_gold.json.
     """
-    raise NotImplementedError
+    from cs329z_hw1.pipelines.priority import classify_priority
+
+    return classify_priority(email, lm)
 
 
 def run_daily_digest(emails: list[Email], lm: LMCallable) -> str:
@@ -79,7 +81,9 @@ def run_daily_digest(emails: list[Email], lm: LMCallable) -> str:
       site that email is about; it contains no term listed for the gold
       ignore emails.
     """
-    raise NotImplementedError
+    from cs329z_hw1.pipelines.daily_digest import daily_digest
+
+    return daily_digest(emails, lm)
 
 
 def run_bm25_build(docs: list[str]) -> Any:
@@ -92,7 +96,12 @@ def run_bm25_build(docs: list[str]) -> Any:
     back to ``run_bm25_search``. The index over the archive must build in
     under 15 seconds.
     """
-    raise NotImplementedError
+
+    # 每个词对应在每篇doc中出现的频率
+
+    from cs329z_hw1.pipelines.bm25 import build_index
+
+    return build_index(docs)
 
 
 def run_bm25_search(index: Any, query: str, k: int) -> list[tuple[int, float]]:
@@ -113,7 +122,9 @@ def run_bm25_search(index: Any, query: str, k: int) -> list[tuple[int, float]]:
       query on average over the archive, and 2 ms for a term that occurs in
       3 of 200,000 documents.
     """
-    raise NotImplementedError
+    from cs329z_hw1.pipelines.bm25 import search_index
+
+    return search_index(index, query, k)
 
 
 def run_email_qa(
@@ -127,7 +138,7 @@ def run_email_qa(
     the top-k emails for a query (the tests build it from YOUR BM25 index;
     you choose k). Return {"answer": str | None, "support": list[str]};
     ``answer`` is None when no answer was found.
-
+    search：一个可调用的搜索函数，输入查询字符串和 Top-K 数量，返回邮件列表
     Rules the tests check:
     * ``search`` is called at most 3 times per question (the hop budget),
       whatever the model replies.
@@ -139,7 +150,10 @@ def run_email_qa(
       contain an accepted answer, and the ``support`` of every correct
       answer includes at least one gold email.
     """
-    raise NotImplementedError
+    # 用邮件 ID 去重并累计各轮证据；这些状态只属于本次问答。
+    from cs329z_hw1.pipelines.email_qa import answer_question
+
+    return answer_question(question, search, lm)
 
 
 # ======================================================================
