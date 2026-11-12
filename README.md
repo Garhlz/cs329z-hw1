@@ -275,3 +275,31 @@ preliminary version of the assignment and offering invaluable feedback.
 If you would like to use this assignment for your course you are welcome to
 do so with brief attribution. It is released under the MIT license (see
 `LICENSE`).
+
+## Using the official DeepSeek API for self-study
+
+Set the following in your `.env` (keep your key private):
+
+```dotenv
+CS329Z_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your-key
+CS329Z_BUDGET_USD=2
+```
+
+All roles (grading, simulated user, judge) then default to `deepseek-flash`.
+Existing `CS329Z_GRADING_MODEL`, `CS329Z_USER_MODEL`, and
+`CS329Z_JUDGE_MODEL` overrides still apply; remove OpenRouter model overrides
+when switching. You may set a role to `deepseek-v4-pro` instead.
+Requests use https://api.deepseek.com with thinking disabled.
+No additional dependencies are needed. Set `CS329Z_PROVIDER=openrouter` to
+restore the course defaults.
+
+Caching, truncation handling, and the spending ledger remain available.
+DeepSeek costs are estimates using peak USD rates checked on 2026-11-12;
+off-peak charges may be lower. The budget is a check before each request,
+not a hard provider-side spending cap.
+See https://api-docs.deepseek.com/quick_start/pricing/ for current prices.
+
+The course's live-test thresholds were calibrated for its original models;
+DeepSeek results are useful for self-study but are not equivalent to official
+grading results.

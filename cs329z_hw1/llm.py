@@ -56,6 +56,7 @@ DEFAULT_MODELS = {
 # OpenAI-compatible API. Model names carry the provider as a prefix
 # ("openai/gpt-6-luna"); https://openrouter.ai/models lists them.
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
+DEEPSEEK_URL = "https://api.deepseek.com"
 
 # Reasoning effort requested from models that accept it (GPT-5 and GPT-6).
 # Override with CS329Z_REASONING_EFFORT.
@@ -69,6 +70,10 @@ DEFAULT_REASONING_EFFORT = "low"
 # https://openrouter.ai/models on 2026-10-05 (the same as OpenAI's list
 # prices).
 PRICES = {
+    # DeepSeek official peak USD rates, checked 2026-11-12.
+    # Conservative estimates: off-peak billing can be lower.
+    "deepseek-flash": (0.30, 0.006, 1.20),
+    "deepseek-v4-pro": (1.32, 0.044, 3.96),
     "gpt-4.1": (2.00, 0.50, 8.00),
     "gpt-4.1-mini": (0.40, 0.10, 1.60),
     "gpt-4.1-nano": (0.10, 0.025, 0.40),
@@ -108,7 +113,15 @@ class OutputTruncated(RuntimeError):
     a larger ``max_tokens`` is a new paid call.
     """
 
-    def __init__(self, text: str, *, model: str, max_tokens: int, output_tokens: int, reasoning_tokens: int = 0):
+    def __init__(
+        self,
+        text: str,
+        *,
+        model: str,
+        max_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int = 0,
+    ):
         self.text = text
         self.model = model
         self.max_tokens = max_tokens
@@ -130,7 +143,12 @@ def resolve_model(role_or_model: str | None = None) -> str:
     """
     name = role_or_model or "grading"
     if name in DEFAULT_MODELS:
-        return os.environ.get(f"CS329Z_{name.upper()}_MODEL", DEFAULT_MODELS[name])
+        default = (
+            "deepseek-flash"
+            if os.environ.get("CS329Z_PROVIDER", "openrouter").lower() == "deepseek"
+            else DEFAULT_MODELS[name]
+        )
+        return os.environ.get(f"CS329Z_{name.upper()}_MODEL", default)
     return name
 
 
@@ -148,7 +166,9 @@ def _price(model: str) -> tuple[float, float, float]:
     return best[1]
 
 
-def cost_usd(model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float:
+def cost_usd(
+    model: str, input_tokens: int, cached_tokens: int, output_tokens: int
+) -> float:
     p_in, p_cached, p_out = _price(model)
     fresh = max(input_tokens - cached_tokens, 0)
     return (fresh * p_in + cached_tokens * p_cached + output_tokens * p_out) / 1_000_000
@@ -169,6 +189,7 @@ def _load_env() -> None:
 _ledger_lock = threading.Lock()
 # Models that reject the temperature or reasoning_effort parameters, learned
 # from the provider's error the first time each is used.
+_capabilities_lock = threading.Lock()
 _NO_TEMPERATURE: set[str] = set()
 _NO_EFFORT: set[str] = set()
 
@@ -202,7 +223,9 @@ def _append_ledger(row: dict) -> None:
 
 def _validate_messages(messages: Sequence[Message]) -> None:
     if not isinstance(messages, (list, tuple)) or not messages:
-        raise ValueError("messages must be a non-empty list of {'role', 'content'} dicts")
+        raise ValueError(
+            "messages must be a non-empty list of {'role', 'content'} dicts"
+        )
     for m in messages:
         if not isinstance(m, dict) or set(m) != {"role", "content"}:
             raise ValueError(
@@ -247,6 +270,10 @@ class LM:
         salt: str = "",
     ) -> None:
         _load_env()
+        self.provider = os.environ.get("CS329Z_PROVIDER", "openrouter").lower()
+        if self.provider not in {"openrouter", "deepseek"}:
+            raise ValueError("CS329Z_PROVIDER must be openrouter or deepseek")
+        self.base_url = DEEPSEEK_URL if self.provider == "deepseek" else OPENROUTER_URL
         self.model = resolve_model(model)
         _price(self.model)  # fail now, not after a paid call, if the price is unknown
         self.temperature = temperature
@@ -262,35 +289,47 @@ class LM:
         self.cost_usd = 0.0
         self.seconds = 0.0
         self._client = None
+        # 仅保护共享状态；网络请求不持有这些锁。
+        self._stats_lock = threading.Lock()
+        self._client_lock = threading.Lock()
 
     # -- public API -------------------------------------------------------
-
+    # 满足了LMCallable = Callable[[list[Message]], str]这个结构化类型
     def __call__(self, messages: Sequence[Message]) -> str:
         _validate_messages(messages)
         messages = [{"role": m["role"], "content": m["content"]} for m in messages]
         key = self._key(messages)
         path = _cache_dir() / key[:2] / f"{key}.json"
-        self.calls += 1
+        with self._stats_lock:
+            self.calls += 1
         if self.cache and path.exists():
-            self.cached_calls += 1
+            with self._stats_lock:
+                self.cached_calls += 1
             return json.loads(path.read_text(encoding="utf-8"))["text"]
 
         self._check_budget()
         start = time.time()
+
+        # 在这里完成模型调用
         text, usage = self._complete(messages)
+
         elapsed = time.time() - start
         cost = usage.get("cost")
         if cost is None:
-            cost = cost_usd(self.model, usage["input"], usage["cached"], usage["output"])
-        self.input_tokens += usage["input"]
-        self.output_tokens += usage["output"]
-        self.cost_usd += cost
-        self.seconds += elapsed
+            cost = cost_usd(
+                self.model, usage["input"], usage["cached"], usage["output"]
+            )
+        with self._stats_lock:
+            self.input_tokens += usage["input"]
+            self.output_tokens += usage["output"]
+            self.cost_usd += cost
+            self.seconds += elapsed
         truncated = usage.get("finish_reason") == "length"
         _append_ledger(
             {
                 "ts": round(start, 3),
                 "model": self.model,
+                "provider": self.provider,
                 "tag": self.tag or os.environ.get("CS329Z_TAG", ""),
                 "input_tokens": usage["input"],
                 "cached_tokens": usage["cached"],
@@ -311,28 +350,39 @@ class LM:
         if self.cache and text.strip():  # an empty reply is not worth remembering
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-            tmp.write_text(json.dumps({"text": text, "model": self.model}), encoding="utf-8")
+            tmp.write_text(
+                json.dumps({"text": text, "model": self.model}), encoding="utf-8"
+            )
             tmp.replace(path)
         return text
 
     def usage(self) -> dict:
         """Totals for this instance since it was created."""
-        return {
-            "model": self.model,
-            "calls": self.calls,
-            "cached_calls": self.cached_calls,
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-            "cost_usd": self.cost_usd,
-            "seconds": self.seconds,
-        }
+        with self._stats_lock:
+            return {
+                "model": self.model,
+                "calls": self.calls,
+                "cached_calls": self.cached_calls,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "cost_usd": self.cost_usd,
+                "seconds": self.seconds,
+            }
 
     # -- internals --------------------------------------------------------
 
     def _key(self, messages: list[Message]) -> str:
         effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
         blob = json.dumps(
-            [self.model, self.temperature, self.max_tokens, effort, self.salt, messages],
+            [
+                self.base_url,
+                self.model,
+                self.temperature,
+                self.max_tokens,
+                effort,
+                self.salt,
+                messages,
+            ],
             sort_keys=True,
             ensure_ascii=False,
         )
@@ -349,22 +399,38 @@ class LM:
                 "Raise the cap in .env if you mean to continue."
             )
 
-    def _complete(self, messages: list[Message]) -> tuple[str, dict]:
+    def _get_client(self):
+        with self._client_lock:
+            return self._initialize_client()
+
+    def _initialize_client(self):
         if self._client is None:
             from openai import OpenAI
 
-            key = os.environ.get("OPENROUTER_API_KEY")
+            key_name = (
+                "DEEPSEEK_API_KEY"
+                if self.provider == "deepseek"
+                else "OPENROUTER_API_KEY"
+            )
+            key = os.environ.get(key_name)
             if not key:
                 raise RuntimeError(
-                    "OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your key."
+                    f"{key_name} is not set. Copy .env.example to .env and add your key."
                 )
             self._client = OpenAI(
-                base_url=OPENROUTER_URL,
+                base_url=self.base_url,
                 api_key=key,
                 max_retries=6,
                 timeout=120,
                 default_headers={"X-Title": "CS329Z HW1"},
             )
+        return self._client
+
+    def _complete(self, messages: list[Message]) -> tuple[str, dict]:
+        client = self._get_client()
+        with _capabilities_lock:
+            no_temperature = self.model in _NO_TEMPERATURE
+            no_effort = self.model in _NO_EFFORT
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -373,30 +439,37 @@ class LM:
             # that the response carry the cost of the call.
             "extra_body": {"usage": {"include": True}},
         }
-        if self.model not in _NO_TEMPERATURE:
+        if not no_temperature:
             kwargs["temperature"] = self.temperature
         effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
-        if effort and self.model not in _NO_EFFORT:
+        if self.provider == "deepseek":
+            # Keep this text-only wrapper inexpensive and avoid reasoning-history requirements.
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        if self.provider == "openrouter" and effort and not no_effort:
             kwargs["extra_body"]["reasoning"] = {"effort": effort}
         try:
-            response = self._client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
         except Exception as exc:  # some models reject temperature or reasoning effort
             text = str(exc)
             if "temperature" in text and "temperature" in kwargs:
-                _NO_TEMPERATURE.add(self.model)
+                with _capabilities_lock:
+                    _NO_TEMPERATURE.add(self.model)
                 kwargs.pop("temperature")
-                response = self._client.chat.completions.create(**kwargs)
+                response = client.chat.completions.create(**kwargs)
             elif "reasoning" in text and "reasoning" in kwargs["extra_body"]:
-                _NO_EFFORT.add(self.model)
+                with _capabilities_lock:
+                    _NO_EFFORT.add(self.model)
                 kwargs["extra_body"].pop("reasoning")
-                response = self._client.chat.completions.create(**kwargs)
+                response = client.chat.completions.create(**kwargs)
             else:
                 raise
         choice = response.choices[0]
         text = choice.message.content or ""
         u = response.usage
         details = getattr(u, "prompt_tokens_details", None)
-        cached = getattr(details, "cached_tokens", 0) or 0
+        cached = getattr(u, "prompt_cache_hit_tokens", None)
+        if cached is None:
+            cached = getattr(details, "cached_tokens", 0) or 0
         out_details = getattr(u, "completion_tokens_details", None)
         reasoning = getattr(out_details, "reasoning_tokens", 0) or 0
         usage = {
@@ -477,10 +550,14 @@ class ScriptedLM:
         if call is None:
             return text
         if self.formatter is None:
-            raise RuntimeError("ScriptedLM needs a formatter to render scripted tool calls")
+            raise RuntimeError(
+                "ScriptedLM needs a formatter to render scripted tool calls"
+            )
         from cs329z_hw1.types import ToolCall
 
-        return self.formatter(text, ToolCall(name=call["name"], args=dict(call.get("args", {}))))
+        return self.formatter(
+            text, ToolCall(name=call["name"], args=dict(call.get("args", {})))
+        )
 
     def usage(self) -> dict:
         return {"model": "scripted", "calls": len(self.calls), "cost_usd": 0.0}
@@ -497,7 +574,9 @@ def spending_report(rows: list[dict] | None = None) -> str:
         short = model.split("-20")[0]  # drop the snapshot date
         tag_key = f"{row.get('tag') or '(untagged)'} [{short}]"
         for table, key in ((by_model, model), (by_tag, tag_key)):
-            agg = table.setdefault(key, {"calls": 0, "cut": 0, "in": 0, "out": 0, "usd": 0.0, "sec": 0.0})
+            agg = table.setdefault(
+                key, {"calls": 0, "cut": 0, "in": 0, "out": 0, "usd": 0.0, "sec": 0.0}
+            )
             agg["calls"] += 1
             agg["cut"] += row.get("finish_reason") == "length"
             agg["in"] += row.get("input_tokens", 0)
@@ -507,7 +586,9 @@ def spending_report(rows: list[dict] | None = None) -> str:
     lines = []
     for title, table in (("By model", by_model), ("By tag and model", by_tag)):
         lines.append(title)
-        lines.append(f"  {'name':<72}{'calls':>7}{'cut':>5}{'in tok':>12}{'out tok':>10}{'USD':>9}{'sec':>8}")
+        lines.append(
+            f"  {'name':<72}{'calls':>7}{'cut':>5}{'in tok':>12}{'out tok':>10}{'USD':>9}{'sec':>8}"
+        )
         for key, agg in sorted(table.items(), key=lambda kv: -kv[1]["usd"]):
             lines.append(
                 f"  {key[-71:]:<72}{agg['calls']:>7}{agg['cut'] or '':>5}{agg['in']:>12}{agg['out']:>10}"
@@ -516,7 +597,10 @@ def spending_report(rows: list[dict] | None = None) -> str:
         lines.append("")
     total = sum(r.get("cost_usd", 0.0) for r in rows)
     cut = sum(r.get("finish_reason") == "length" for r in rows)
-    lines.append(f"Total: {len(rows)} calls, ${total:.3f}" + (f"; {cut} cut off at max_tokens" if cut else ""))
+    lines.append(
+        f"Total: {len(rows)} calls, ${total:.3f}"
+        + (f"; {cut} cut off at max_tokens" if cut else "")
+    )
     return "\n".join(lines)
 
 
