@@ -1,1 +1,1 @@
-"""Your Part 1 pipelines go in this package."""
+"""第 1 部分的邮件处理流水线。"""

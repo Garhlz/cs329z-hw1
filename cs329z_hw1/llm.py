@@ -1,33 +1,25 @@
-"""Course-provided language model wrapper.
+"""课程提供的语言模型封装。
 
-This module gives you exactly one primitive: a chat-completion call that takes
-a list of messages and returns a string.
+本模块只提供一个基本操作：接收消息列表的聊天补全调用，返回字符串。
 
-    lm = LM()                                  # the grading model
+    lm = LM()                                  # 作业使用的模型
     text = lm([{"role": "system", "content": "..."},
                {"role": "user", "content": "..."}])
 
-There is no tool-calling parameter and no structured-output parameter. Those
-are yours to build on top of this call.
+接口不提供工具调用参数或结构化输出参数；这些功能需要你在此调用之上自行构建。
 
-What the wrapper does for you:
+封装提供：
+* 磁盘缓存：每次调用缓存到 .lm_cache/，按模型、采样设置和完整消息内容区分。
+  代码及请求不变时重复运行不产生费用。
+* 费用账本：每个实际发送到服务商的调用追加到 .lm_cache/ledger.jsonl，
+  记录 token 用量和美元费用。运行 uv run python -m cs329z_hw1.llm 查看支出报告。
+* 预算停止：设置 CS329Z_BUDGET_USD 后，当账本累计金额达到上限，
+  抛出 BudgetExceeded，不再发起新请求。
+* 截断处理：模型因达到 max_tokens 停止时，抛出 OutputTruncated，
+  不直接返回被截断的文本。异常携带已生成文本（.text）和 token 用量。
+  该调用仍计费并写入账本，但不会缓存。
 
-* Disk cache. Every call is cached under ``.lm_cache/`` keyed on the model,
-  the sampling settings, and the exact messages. Re-running unchanged code
-  costs nothing.
-* Cost ledger. Every call that reaches the provider is appended to
-  ``.lm_cache/ledger.jsonl`` with its token counts and dollar cost.
-  ``uv run python -m cs329z_hw1.llm`` prints a spending report.
-* Budget stop. If ``CS329Z_BUDGET_USD`` is set, the wrapper raises
-  ``BudgetExceeded`` instead of making a call once the ledger total passes it.
-* Truncation. A call that stops because the model reached ``max_tokens``
-  raises ``OutputTruncated`` instead of returning the cut-off text. The
-  exception carries the text produced so far (``.text``) and the token
-  counts. The call is charged and recorded in the ledger but not cached.
-
-``ScriptedLM`` is a drop-in fake used by the deterministic tests. It replays a
-fixed list of replies and never touches the network.
-"""
+ScriptedLM 是确定性测试使用的替代模型，重放固定回复列表，不访问网络。"""
 
 from __future__ import annotations
 
@@ -44,34 +36,31 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 Message = dict  # {"role": "system" | "user" | "assistant", "content": str}
 
-# Model used for each role. Override any of these with the environment
-# variable CS329Z_<ROLE>_MODEL, e.g. CS329Z_GRADING_MODEL.
+# 各角色的默认模型，可用 CS329Z_<ROLE>_MODEL 环境变量覆盖。
+# 例如 CS329Z_GRADING_MODEL 指定作业模型。
 DEFAULT_MODELS = {
-    "grading": "openai/gpt-6-luna",  # the model your agent is graded with
-    "user": "openai/gpt-6-luna",  # plays the simulated users
-    "judge": "openai/gpt-6-sol",  # scores evaluation transcripts
+    "grading": "openai/gpt-6-luna",  # 作业使用的模型
+    "user": "openai/gpt-6-luna",  # 模拟用户
+    "judge": "openai/gpt-6-sol",  # 评估对话记录
 }
 
-# Calls go to OpenRouter, which fronts many providers behind one
-# OpenAI-compatible API. Model names carry the provider as a prefix
-# ("openai/gpt-6-luna"); https://openrouter.ai/models lists them.
+# OpenRouter 通过兼容 OpenAI 的接口提供多个厂商的模型。
+# 模型名称含厂商前缀，例如 openai/gpt-6-luna。
+# 可用模型见 https://openrouter.ai/models。
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEEPSEEK_URL = "https://api.deepseek.com"
 
-# Reasoning effort requested from models that accept it (GPT-5 and GPT-6).
-# Override with CS329Z_REASONING_EFFORT.
+# 支持推理强度的模型使用此默认值。
+# 可用 CS329Z_REASONING_EFFORT 覆盖。
 DEFAULT_REASONING_EFFORT = "low"
 
-# USD per 1M tokens: (input, cached input, output), keyed by the model name
-# without its provider prefix. OpenRouter reports the exact cost of each
-# call in the response, and the ledger records that; this table is the
-# fallback for a response without one, and it is checked when an LM is
-# created so that an unknown model fails before a paid call. Read from
-# https://openrouter.ai/models on 2026-10-05 (the same as OpenAI's list
-# prices).
+# 每百万 token 的美元价格：(普通输入、缓存输入、输出)。
+# 键使用不含厂商前缀的模型名。优先记录服务商返回的费用，否则按表估算。
+# 创建 LM 时检查价格，防止付费调用后才发现无法计费。
+# OpenRouter 价格来源：https://openrouter.ai/models，查询日期 2026-10-05。
 PRICES = {
-    # DeepSeek official peak USD rates, checked 2026-11-12.
-    # Conservative estimates: off-peak billing can be lower.
+    # DeepSeek 官网高峰美元价格，查询日期 2026-11-12。
+    # 按高峰价格保守估算，低峰实际扣费可能更低。
     "deepseek-flash": (0.30, 0.006, 1.20),
     "deepseek-v4-pro": (1.32, 0.044, 3.96),
     "gpt-4.1": (2.00, 0.50, 8.00),
@@ -95,23 +84,20 @@ VALID_ROLES = ("system", "user", "assistant")
 
 
 class BudgetExceeded(RuntimeError):
-    """Raised instead of calling the provider once the spend cap is reached."""
+    """累计支出达到预算时抛出，阻止新的付费请求。"""
 
 
 class ScriptExhausted(RuntimeError):
-    """Raised when a ScriptedLM is called more times than its script allows."""
+    """模拟模型的调用次数超过预设回复数量时抛出。"""
 
 
 class OutputTruncated(RuntimeError):
-    """Raised when the model stopped because it reached ``max_tokens``.
+    """模型因达到 max_tokens 而停止时抛出。
 
-    ``text`` is what the model wrote before the cut, which is often empty:
-    a reasoning model's hidden reasoning counts against the same limit, so
-    the limit can be used up before any visible text is written.
-    ``output_tokens`` is the whole output, ``reasoning_tokens`` the hidden
-    part of it (0 when the provider does not report it). Calling again with
-    a larger ``max_tokens`` is a new paid call.
-    """
+    text 是截断前已生成的文本，通常可能为空：
+    推理模型的隐藏推理也占用同一输出额度，可能在生成任何可见文本前就用完额度。
+    output_tokens 是全部输出 token 数；reasoning_tokens 是其中隐藏推理的数量，
+    服务商未报告时为 0。增大 max_tokens 后再次调用，属于新的付费请求。"""
 
     def __init__(
         self,
@@ -136,11 +122,9 @@ class OutputTruncated(RuntimeError):
 
 
 def resolve_model(role_or_model: str | None = None) -> str:
-    """Map a role ("grading", "user", "judge") to a model name.
+    """将 grading、user、judge 角色解析为配置的模型名称。
 
-    ``None`` means "grading". A string that is not a role is returned
-    unchanged, so you can pass a model name.
-    """
+None 使用 grading；其他字符串视为模型名称，原样返回。"""
     name = role_or_model or "grading"
     if name in DEFAULT_MODELS:
         default = (
@@ -187,8 +171,8 @@ def _load_env() -> None:
 
 
 _ledger_lock = threading.Lock()
-# Models that reject the temperature or reasoning_effort parameters, learned
-# from the provider's error the first time each is used.
+# 记录拒绝 temperature 或推理强度参数的模型。
+# 首次调用报错后更新，后续调用省略不支持的参数。
 _capabilities_lock = threading.Lock()
 _NO_TEMPERATURE: set[str] = set()
 _NO_EFFORT: set[str] = set()
@@ -238,26 +222,23 @@ def _validate_messages(messages: Sequence[Message]) -> None:
 
 
 class LM:
-    """A chat model: messages in, string out.
+    """聊天模型：输入消息列表，输出字符串。
 
-    Parameters
-    ----------
-    model:
-        A role ("grading", "user", "judge"), an OpenRouter model name such
-        as "openai/gpt-6-sol", or ``None`` for "grading".
-    temperature, max_tokens:
-        Sampling settings. They are part of the cache key. Reasoning models
-        spend part of ``max_tokens`` on hidden reasoning, so keep it large.
-        Models that reject ``temperature`` are called without it.
-    tag:
-        A free-form label written to the cost ledger so spending can be
-        grouped (the test suite sets it to the test name).
-    cache:
-        Set to False to bypass the disk cache for this instance.
-    salt:
-        Extra string mixed into the cache key. Two instances with different
-        salts get independent samples for identical messages.
-    """
+    参数
+    ----
+    model：
+        角色名称（grading、user、judge），或 OpenRouter 模型名
+        （例如 openai/gpt-6-sol）；None 表示 grading。
+    temperature、max_tokens：
+        采样设置，同时参与缓存键。推理模型会将部分 max_tokens 用于隐藏推理，
+        因此应预留足够额度。不支持 temperature 的模型会省略该参数调用。
+    tag：
+        写入费用账本的自定义标签，便于分组统计支出。
+        测试套件会将它设为测试名称。
+    cache：
+        设为 False 时，此实例跳过磁盘缓存。
+    salt：
+        混入缓存键的额外字符串。不同 salt 的实例针对相同消息获得独立样本。"""
 
     def __init__(
         self,
@@ -275,13 +256,13 @@ class LM:
             raise ValueError("CS329Z_PROVIDER must be openrouter or deepseek")
         self.base_url = DEEPSEEK_URL if self.provider == "deepseek" else OPENROUTER_URL
         self.model = resolve_model(model)
-        _price(self.model)  # fail now, not after a paid call, if the price is unknown
+        _price(self.model)  # 先检查计价配置，避免付费后才报错
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.tag = tag
         self.cache = cache
         self.salt = salt
-        # Running totals for this instance.
+        # 当前实例的累计调用统计。
         self.calls = 0
         self.cached_calls = 0
         self.input_tokens = 0
@@ -293,7 +274,7 @@ class LM:
         self._stats_lock = threading.Lock()
         self._client_lock = threading.Lock()
 
-    # -- public API -------------------------------------------------------
+    # -- 对外接口 -------------------------------------------------------
     # 满足了LMCallable = Callable[[list[Message]], str]这个结构化类型
     def __call__(self, messages: Sequence[Message]) -> str:
         _validate_messages(messages)
@@ -339,7 +320,7 @@ class LM:
                 "finish_reason": usage.get("finish_reason"),
             }
         )
-        if truncated:  # charged and logged, never cached
+        if truncated:  # 截断请求仍计费并记账，但不缓存
             raise OutputTruncated(
                 text,
                 model=self.model,
@@ -347,7 +328,7 @@ class LM:
                 output_tokens=usage["output"],
                 reasoning_tokens=usage.get("reasoning", 0),
             )
-        if self.cache and text.strip():  # an empty reply is not worth remembering
+        if self.cache and text.strip():  # 空回复不缓存
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
             tmp.write_text(
@@ -357,7 +338,7 @@ class LM:
         return text
 
     def usage(self) -> dict:
-        """Totals for this instance since it was created."""
+        """返回当前实例自创建以来的累计统计快照。"""
         with self._stats_lock:
             return {
                 "model": self.model,
@@ -369,7 +350,7 @@ class LM:
                 "seconds": self.seconds,
             }
 
-    # -- internals --------------------------------------------------------
+    # -- 内部实现 --------------------------------------------------------
 
     def _key(self, messages: list[Message]) -> str:
         effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
@@ -435,21 +416,21 @@ class LM:
             "model": self.model,
             "messages": messages,
             "max_tokens": self.max_tokens,
-            # OpenRouter extensions: the reasoning effort, and the request
-            # that the response carry the cost of the call.
+            # OpenRouter 扩展参数：请求回复携带本次调用费用。
+            # 下方按配置补充推理强度。
             "extra_body": {"usage": {"include": True}},
         }
         if not no_temperature:
             kwargs["temperature"] = self.temperature
         effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
         if self.provider == "deepseek":
-            # Keep this text-only wrapper inexpensive and avoid reasoning-history requirements.
+            # 关闭思考模式，降低开销并避免额外的推理历史要求。
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if self.provider == "openrouter" and effort and not no_effort:
             kwargs["extra_body"]["reasoning"] = {"effort": effort}
         try:
             response = client.chat.completions.create(**kwargs)
-        except Exception as exc:  # some models reject temperature or reasoning effort
+        except Exception as exc:  # 部分模型不支持温度或推理强度参数
             text = str(exc)
             if "temperature" in text and "temperature" in kwargs:
                 with _capabilities_lock:
@@ -479,29 +460,25 @@ class LM:
             "reasoning": reasoning,
             "finish_reason": getattr(choice, "finish_reason", None),
         }
-        cost = getattr(u, "cost", None)  # OpenRouter's figure for this call
+        cost = getattr(u, "cost", None)  # OpenRouter 返回的本次实际费用
         if isinstance(cost, (int, float)):
             usage["cost"] = float(cost)
         return text, usage
 
 
 class ScriptedLM:
-    """A fake LM that replays a fixed script. Used by the deterministic tests.
+    """重放固定脚本的模拟模型，供确定性测试替代真实 LM 使用。
 
-    Each script entry is one model reply, given as one of:
+    脚本每项表示一次模型回复，支持三种形式：
+    * 字符串：原样返回。
+    * 字典 {"text": str, "tool_call": {"name": str, "args": dict}}：
+      通过 formatter(text, ToolCall) 转为字符串。
+      测试将你的 run_format_tool_call 适配器作为 formatter，
+      因此预设工具调用会使用你定义的格式。
+    * 可调用对象 f(messages) -> str。
 
-    * a string, returned as is;
-    * a dict ``{"text": str, "tool_call": {"name": str, "args": dict}}``,
-      rendered to a string by ``formatter(text, ToolCall)``. The tests pass
-      your ``run_format_tool_call`` adapter as the formatter, so scripted
-      tool calls arrive in your own format;
-    * a callable ``f(messages) -> str``.
-
-    Every call's messages are recorded in ``.calls`` so tests can inspect
-    exactly what your code sent to the model. When the script runs out the
-    LM raises ``ScriptExhausted``, unless ``repeat_last=True``, in which case
-    the last entry is replayed forever.
-    """
+    每次调用的消息记录在 .calls 中，测试可检查代码实际发给模型的完整内容。
+    脚本耗尽时抛出 ScriptExhausted；若 repeat_last=True，则无限重放最后一项。"""
 
     model = "scripted"
 
@@ -571,7 +548,7 @@ def spending_report(rows: list[dict] | None = None) -> str:
     by_tag: dict[str, dict] = {}
     for row in rows:
         model = row.get("model", "?")
-        short = model.split("-20")[0]  # drop the snapshot date
+        short = model.split("-20")[0]  # 去掉模型快照日期
         tag_key = f"{row.get('tag') or '(untagged)'} [{short}]"
         for table, key in ((by_model, model), (by_tag, tag_key)):
             agg = table.setdefault(

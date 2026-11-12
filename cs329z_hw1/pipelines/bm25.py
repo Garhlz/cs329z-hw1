@@ -10,15 +10,10 @@ from cs329z_hw1.tokenizer import tokenize
 
 
 def build_index(docs: list[str]) -> Any:
-    """Problem (bm25).
+    """构建 BM25 倒排索引，文档编号采用输入列表下标。
 
-    Build and return a BM25 index over ``docs``. Document ids are list
-    positions. Tokenize with ``cs329z_hw1.tokenizer.tokenize``. A document
-    with no tokens is still a document (it counts in N and in the average
-    length). The returned object is opaque to the tests; they only pass it
-    back to ``run_bm25_search``. The index over the archive must build in
-    under 15 seconds.
-    """
+使用课程 tokenize 分词。空文档仍计入文档总数和平均长度。
+返回的索引交给 search_index 使用；完整邮件档案建索引应少于 15 秒。"""
 
     # 每个词对应在每篇doc中出现的频率
 
@@ -49,23 +44,12 @@ def build_index(docs: list[str]) -> Any:
 
 
 def search_index(index: Any, query: str, k: int) -> list[tuple[int, float]]:
-    """Problem (bm25).
+    """返回前 k 个 (文档编号, 分数)，按分数降序、编号升序排列。
 
-    Return the top-k ``(doc_id, score)`` pairs for ``query`` as
-    ``(int, float)`` tuples, best first, ties broken by lower doc_id (the
-    document's position in the ``docs`` list given to ``run_bm25_build``).
-
-    Rules the tests check:
-    * Scores follow the handout's formula (k1 = 1.5, b = 0.75, Lucene IDF)
-      to within 1e-6. The query is tokenized like the documents, and a term
-      repeated in the query counts once.
-    * A document that shares no term with the query is never returned, so
-      the list may be shorter than k. A query with no tokens, or whose terms
-      occur in no document, returns [].
-    * A search reads only the index entries of the query's terms: 20 ms per
-      query on average over the archive, and 2 ms for a term that occurs in
-      3 of 200,000 documents.
-    """
+使用 k1=1.5、b=0.75 和 Lucene IDF；重复查询词只计算一次。
+仅访问查询词的倒排表，不返回没有匹配词的文档。
+查询无有效词或无命中时返回空列表。
+档案平均查询应少于 20 毫秒，稀有词查询应少于 2 毫秒。"""
     if k <= 0:
         return []
     postings = index["postings"]

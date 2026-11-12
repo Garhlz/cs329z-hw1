@@ -19,7 +19,7 @@ class ToolRegistry:
         ]
 
     def validate(self, name: str, args: dict) -> ToolResult | None:
-        # 如果验证成功的话返回正确
+        # 校验成功返回 None；失败返回对应的 ToolResult，不执行工具。
         if not self.tools.get(name):
             return ToolResult(
                 status="unknown_tool",
