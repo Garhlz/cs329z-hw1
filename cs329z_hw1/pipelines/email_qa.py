@@ -64,7 +64,6 @@ code fences, commentary, or additional text.
 """
 
 
-
 def answer_question(
     question: str,
     search: Callable[[str, int], list[Email]],
@@ -72,11 +71,11 @@ def answer_question(
 ) -> dict:
     """通过最多三次搜索回答邮件档案问题。
 
-search(query, k) 返回候选邮件，本函数不负责建立索引。
-模型根据累计证据选择回答或继续搜索。
-返回 answer（字符串或 None）及 support（实际检索到的邮件 ID 列表）。
-无证据、格式错误或没有有效引用时保守返回无法回答。
-真实评测要求答案准确率至少 70%，正确答案引用至少一封标准依据邮件。"""
+    search(query, k) 返回候选邮件，本函数不负责建立索引。
+    模型根据累计证据选择回答或继续搜索。
+    返回 answer（字符串或 None）及 support（实际检索到的邮件 ID 列表）。
+    无证据、格式错误或没有有效引用时保守返回无法回答。
+    真实评测要求答案准确率至少 70%，正确答案引用至少一封标准依据邮件。"""
     # 用邮件 ID 去重并累计各轮证据；这些状态只属于本次问答。
     seen_emails = {}
     # 列表保留搜索顺序供模型参考，集合用于快速拦截重复查询。
@@ -183,4 +182,3 @@ search(query, k) 返回候选邮件，本函数不负责建立索引。
         # 保留旧证据并合入新结果，以支持跨邮件的多跳推断。
         for email in emails:
             seen_emails[str(email["id"])] = email
-
