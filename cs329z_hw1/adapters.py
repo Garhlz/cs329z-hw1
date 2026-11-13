@@ -225,7 +225,10 @@ def run_build_doc_index(docs: list[dict]) -> Any:
     例如文档或分块的 BM25 索引及原始文本。
     测试只构建一次，并将索引传给这两个入口。
     search_docs 和 read_doc 工具应在首次需要时构建索引，并共享该索引。"""
-    raise NotImplementedError
+
+    from cs329z_hw1.pipelines.search_docs import build_doc_index
+
+    return build_doc_index(docs)
 
 
 def run_search_docs(index: Any, query: str, k: int = 5) -> list[SearchResult]:
@@ -239,7 +242,9 @@ def run_search_docs(index: Any, query: str, k: int = 5) -> list[SearchResult]:
       且与原文共享至少 4 个连续单词。
     * 某词只在一份文档出现时，该文档必须排第一，且 snippet 包含该词。
     * 相同调用每次都返回相同结果。"""
-    raise NotImplementedError
+    from cs329z_hw1.pipelines.search_docs import search_docs
+
+    return search_docs(index, query, k)
 
 
 def run_read_doc(index: Any, doc_id: str, start_line: int = 1) -> DocWindow:
@@ -254,4 +259,7 @@ def run_read_doc(index: Any, doc_id: str, start_line: int = 1) -> DocWindow:
     * 从 end_line + 1 再读时连续无缺口，最后窗口的 end_line 等于 total_lines。
     * doc_id 不存在，或 start_line 不在 1..total_lines 内时，
       抛出 ValueError 或 LookupError。"""
-    raise NotImplementedError
+
+    from cs329z_hw1.pipelines.search_docs import read_doc
+
+    return read_doc(index, doc_id, start_line)

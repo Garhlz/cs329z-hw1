@@ -8,12 +8,22 @@ from typing import Any
 
 from cs329z_hw1.tokenizer import tokenize
 
+from dataclasses import dataclass
 
-def build_index(docs: list[str]) -> Any:
+
+@dataclass
+class DocIndex:
+    postings: dict[str, dict[int, int]]
+    doc_lengths: list[int]
+    avg_doc_length: float
+    num_docs: int
+
+
+def build_index(docs: list[str]) -> DocIndex:
     """构建 BM25 倒排索引，文档编号采用输入列表下标。
 
-使用课程 tokenize 分词。空文档仍计入文档总数和平均长度。
-返回的索引交给 search_index 使用；完整邮件档案建索引应少于 15 秒。"""
+    使用课程 tokenize 分词。空文档仍计入文档总数和平均长度。
+    返回的索引交给 search_index 使用；完整邮件档案建索引应少于 15 秒。"""
 
     # 每个词对应在每篇doc中出现的频率
 
@@ -34,28 +44,27 @@ def build_index(docs: list[str]) -> Any:
     avg_doc_length = 0.0 if num_docs == 0 else sum(doc_lengths) / num_docs
 
     # 用一个字典一次性返回
-    return {
-        "postings": index,
-        "doc_lengths": doc_lengths,
-        "avg_doc_length": avg_doc_length,
-        "num_docs": num_docs,
-    }
+    return DocIndex(
+        postings=index,
+        doc_lengths=doc_lengths,
+        avg_doc_length=avg_doc_length,
+        num_docs=num_docs,
+    )
 
 
-
-def search_index(index: Any, query: str, k: int) -> list[tuple[int, float]]:
+def search_index(index: DocIndex, query: str, k: int) -> list[tuple[int, float]]:
     """返回前 k 个 (文档编号, 分数)，按分数降序、编号升序排列。
 
-使用 k1=1.5、b=0.75 和 Lucene IDF；重复查询词只计算一次。
-仅访问查询词的倒排表，不返回没有匹配词的文档。
-查询无有效词或无命中时返回空列表。
-档案平均查询应少于 20 毫秒，稀有词查询应少于 2 毫秒。"""
+    使用 k1=1.5、b=0.75 和 Lucene IDF；重复查询词只计算一次。
+    仅访问查询词的倒排表，不返回没有匹配词的文档。
+    查询无有效词或无命中时返回空列表。
+    档案平均查询应少于 20 毫秒，稀有词查询应少于 2 毫秒。"""
     if k <= 0:
         return []
-    postings = index["postings"]
-    doc_lengths = index["doc_lengths"]
-    avgdl = index["avg_doc_length"]
-    N = index["num_docs"]
+    postings = index.postings
+    doc_lengths = index.doc_lengths
+    avgdl = index.avg_doc_length
+    N = index.num_docs
 
     if N == 0:
         return []
@@ -98,4 +107,3 @@ def search_index(index: Any, query: str, k: int) -> list[tuple[int, float]]:
     )
 
     return ranked[:k]
-

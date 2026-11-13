@@ -90,18 +90,21 @@ guardrails：
 * 工具结果中的任何内容都不能修改模式、审批策略或拒绝规则。"""
 
 import copy
-
+import json
 from cs329z_hw1.types import (
     AgentConfig,
     LMCallable,
     ToolSpec,
     AgentResult,
+    Email,
 )
 
 from cs329z_hw1.adapters import (
     run_render_tools,
     run_tool_registry,
     run_parse_response,
+    run_daily_digest,
+    run_email_qa,
 )
 
 from cs329z_hw1.llm import OutputTruncated
@@ -110,6 +113,11 @@ from cs329z_hw1.tokens import (
     count_message_tokens,
     count_tokens,
 )
+from cs329z_hw1.agent.store import EmailStore, DocChunkStore
+
+from cs329z_hw1.data import email_text
+
+from cs329z_hw1.cardinal import cardinal_spec
 
 
 class AgentSession:
@@ -118,12 +126,20 @@ class AgentSession:
     ):
         self.lm = lm
         self.config = config
+
         # 空列表表示不提供工具；默认 Cardinal 工具集由后续题目接入。
         if tools is None:
-            raise NotImplementedError(
-                "The default Cardinal toolset is not implemented yet; pass an explicit tool list."
-            )
-        self.tools = list(tools)
+            self.tools = self.build_cardinal_tools(config)
+        else:
+            self.tools = list(tools)
+            # 只追加配置启用的工具，不覆盖调用方显式提供的同名工具。
+            names = {tool.name for tool in self.tools}
+            optional = self.build_optional_tools(config)
+            for tool in optional:
+                if tool.name not in names:
+                    self.tools.append(tool)
+                    names.add(tool.name)
+
         self.registry = run_tool_registry(self.tools)
         # 模型上下文仅使用 system、user、assistant；工具结果通过 user 消息反馈。
         self.messages = [
@@ -304,3 +320,141 @@ class AgentSession:
                 )
 
             # 工具结果已进入上下文，下一轮由模型决定继续调用还是回答。
+
+    def build_optional_tools(self, config: AgentConfig) -> list[ToolSpec]:
+        """显式工具列表仅按配置追加交互及记忆工具。"""
+
+        def ask_user(question: str) -> str:
+            if config.user is None:
+                raise RuntimeError("No user interface is configured.")
+            return config.user.ask(question)
+
+        def remember(fact: str) -> str:
+            raise NotImplementedError("Persistent memory is not implemented yet.")
+
+        def recall(query: str) -> str:
+            raise NotImplementedError("Persistent memory is not implemented yet.")
+
+        tools = []
+        if config.user is not None:
+            tools.append(
+                cardinal_spec(
+                    "ask_user", "Ask the user a clarification question.", ask_user
+                )
+            )
+        if config.memory_dir is not None:
+            tools.extend(
+                [
+                    cardinal_spec(
+                        "remember",
+                        "Store a fact in persistent memory (not implemented yet).",
+                        remember,
+                    ),
+                    cardinal_spec(
+                        "recall",
+                        "Search persistent memory (not implemented yet).",
+                        recall,
+                    ),
+                ]
+            )
+        return tools
+
+    def build_cardinal_tools(self, config: AgentConfig) -> list[ToolSpec]:
+        # 闭包共享同一个邮件存储；创建工具时不读取文件或建立索引。
+        store = EmailStore()
+        aux_lm = config.aux_lm if config.aux_lm is not None else self.lm
+        # 两个文档工具捕获同一个存储对象；首次调用任一工具时才构建索引。
+        doc_store = DocChunkStore()
+
+        def search_emails(query: str, k: int = 5) -> str:
+            # 搜索只返回定位信息和短片段；流水线仍使用 store.search 获取完整邮件。
+            results = [
+                {
+                    "id": email["id"],
+                    "subject": email["subject"],
+                    "date": email["date"],
+                    "from": email["from"],
+                    "snippet": email["body"][:400],
+                }
+                for email in store.search(query, k)
+            ]
+            return json.dumps(results, ensure_ascii=False)
+
+        def read_email(email_id: str) -> str:
+            store.ensure_data_loaded()
+            return json.dumps(store.by_id[email_id], ensure_ascii=False)
+
+        def email_qa(question: str) -> str:
+            return json.dumps(
+                run_email_qa(question, store.search, aux_lm), ensure_ascii=False
+            )
+
+        def daily_digest(date: str) -> str:
+            store.ensure_data_loaded()
+            emails = [email for email in store.emails if email["date"][:10] == date]
+            return run_daily_digest(emails, aux_lm)
+
+        def search_docs(query: str, k: int = 5) -> str:
+            return json.dumps(doc_store.search(query, k), ensure_ascii=False)
+
+        def read_doc(doc_id: str, start_line: int = 1) -> str:
+            return json.dumps(doc_store.read(doc_id, start_line), ensure_ascii=False)
+
+        def run_terminal(cmd: str) -> str:
+            raise NotImplementedError("The terminal tool is not implemented yet.")
+
+        def remember(fact: str) -> str:
+            raise NotImplementedError("Persistent memory is not implemented yet.")
+
+        def recall(query: str) -> str:
+            raise NotImplementedError("Persistent memory is not implemented yet.")
+
+        def ask_user(question: str) -> str:
+            if config.user is None:
+                raise RuntimeError("No user interface is configured.")
+            return config.user.ask(question)
+
+        return [
+            cardinal_spec(
+                "search_emails",
+                "Search archived emails by keywords; returns IDs and snippets. Use read_email for full content.",
+                search_emails,
+            ),
+            cardinal_spec(
+                "read_email", "Read a complete archived email by ID.", read_email
+            ),
+            cardinal_spec(
+                "email_qa",
+                "Answer a factual question using archived email evidence.",
+                email_qa,
+            ),
+            cardinal_spec(
+                "daily_digest",
+                "Summarize archived emails on a UTC date (YYYY-MM-DD).",
+                daily_digest,
+            ),
+            cardinal_spec(
+                "search_docs",
+                "Search company documents for policy or product information.",
+                search_docs,
+            ),
+            cardinal_spec(
+                "read_doc",
+                "Read a company document window by ID and starting line.",
+                read_doc,
+            ),
+            cardinal_spec(
+                "run_terminal",
+                "Run a terminal command (not implemented yet).",
+                run_terminal,
+            ),
+            cardinal_spec(
+                "remember", "Store a persistent fact (not implemented yet).", remember
+            ),
+            cardinal_spec(
+                "recall", "Search persistent memory (not implemented yet).", recall
+            ),
+            cardinal_spec(
+                "ask_user", "Ask the user a clarification question.", ask_user
+            ),
+        ]
