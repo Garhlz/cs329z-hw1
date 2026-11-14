@@ -124,7 +124,7 @@ class OutputTruncated(RuntimeError):
 def resolve_model(role_or_model: str | None = None) -> str:
     """将 grading、user、judge 角色解析为配置的模型名称。
 
-None 使用 grading；其他字符串视为模型名称，原样返回。"""
+    None 使用 grading；其他字符串视为模型名称，原样返回。"""
     name = role_or_model or "grading"
     if name in DEFAULT_MODELS:
         default = (
@@ -407,6 +407,13 @@ class LM:
             )
         return self._client
 
+    def _request_options(self, messages):
+        """默认纯文本请求；原生工具适配器覆盖此扩展点。"""
+        return {"messages": messages}
+
+    def _response_text(self, message):
+        return message.content or ""
+
     def _complete(self, messages: list[Message]) -> tuple[str, dict]:
         client = self._get_client()
         with _capabilities_lock:
@@ -420,6 +427,7 @@ class LM:
             # 下方按配置补充推理强度。
             "extra_body": {"usage": {"include": True}},
         }
+        kwargs.update(self._request_options(messages))
         if not no_temperature:
             kwargs["temperature"] = self.temperature
         effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
@@ -445,7 +453,7 @@ class LM:
             else:
                 raise
         choice = response.choices[0]
-        text = choice.message.content or ""
+        text = self._response_text(choice.message)
         u = response.usage
         details = getattr(u, "prompt_tokens_details", None)
         cached = getattr(u, "prompt_cache_hit_tokens", None)

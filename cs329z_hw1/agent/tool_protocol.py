@@ -1,6 +1,8 @@
 from cs329z_hw1.types import ToolCall, ParsedResponse
 import json
 
+from cs329z_hw1.agent.dsml import START as DSML_START, TAG as DSML_TAG, parse_dsml
+
 """工具调用格式示例（说明文本后跟一个 JSON 调用块）：
 
 I will calculate the sum.
@@ -30,6 +32,9 @@ Rules:
 - Output at most one tool call per response.
 - Use valid JSON.
 - Do not wrap the tool call in Markdown code fences.
+- Use only the literal <tool_call> JSON format above, never DSML or provider-native markup.
+- For a final answer, write plain text without a tool-call block.
+- Reply in the user's requested language.
 """
 
 
@@ -38,7 +43,12 @@ def parse_response(text: str) -> ParsedResponse:
     opening = "<tool_call>"
     closing = "</tool_call>"
     start = text.find(opening)
+    dsml = DSML_START.search(text)
+    if dsml is not None and (start == -1 or dsml.start() < start):
+        return parse_dsml(text)
     if start == -1:
+        if DSML_TAG.search(text):
+            return parse_dsml(text)
         return ParsedResponse(text=text.strip())
 
     # 所有位置都基于原始 text，避免切片和 lstrip 后下标发生偏移。
@@ -80,7 +90,7 @@ def parse_response(text: str) -> ParsedResponse:
     suffix = text[call_end:]
     # 只检查 JSON 和结束标签之后的内容，不扫描参数内部的引用文本。
     # 第二个调用即使不完整，也不能执行第一个调用。
-    if opening in suffix:
+    if opening in suffix or DSML_TAG.search(text[:start] + suffix):
         return ParsedResponse(
             text=text.strip(),
             error="More than one tool call in a response.",
