@@ -89,7 +89,11 @@ guardrails：
     tool_result 返回 denied，内容非空。
 * 工具结果中的任何内容都不能修改模式、审批策略或拒绝规则。"""
 
+from cs329z_hw1.agent.task_progress import TaskProgress, bounded_search_results
+
 import copy
+import logging
+import time
 from cs329z_hw1.agent.context import ContextMessage
 from cs329z_hw1.agent.memory import FactMemory
 import json
@@ -97,6 +101,8 @@ from cs329z_hw1.types import (
     AgentConfig,
     LMCallable,
     ToolSpec,
+    ToolCall,
+    ToolResult,
     AgentResult,
     Email,
 )
@@ -126,6 +132,8 @@ class AgentSession:
     def __init__(
         self, lm: LMCallable, tools: list[ToolSpec] | None, config: AgentConfig
     ):
+        # 界面可设置 on_progress；默认不产生终端输出，不参与模型上下文。
+        self.on_progress = None
         self.lm = lm
         self.config = config
         self.memory = FactMemory(config.memory_dir)
@@ -146,6 +154,7 @@ class AgentSession:
         self.registry = run_tool_registry(self.tools)
         # 模型上下文仅使用 system、user、assistant；工具结果通过 user 消息反馈。
         # request_id 按 send 递增，turn_id 按内部消息轮次递增，均不跨请求重置。
+        self.task_progress = TaskProgress()
         self._request_id = 0
         self._turn_id = 0
         self.messages: list[ContextMessage] = [
@@ -162,19 +171,33 @@ class AgentSession:
         self.transcript = []  # 只追加的事件日志，与模型上下文分开保存
 
     def set_mode(self, mode: str) -> None:
-        """更新会话模式；具体审批流程将在交互题中实现。"""
+        """更新会话模式；下一次工具调用按新的审批策略处理。"""
         if mode not in {"auto", "confirm"}:
             raise ValueError("mode must be 'auto' or 'confirm'")
         self.config.mode = mode
 
     def send(self, user_message: str) -> AgentResult:
         """延续当前对话；返回本次停止原因及完整日志的独立快照。"""
+        # 简单“继续”延续调查清单；新问题启动新阶段，避免不同任务互相污染。
+        if user_message.strip().lower().rstrip("?!？。") not in {
+            "继续",
+            "continue",
+            "go on",
+        }:
+            self.task_progress = TaskProgress()
+        else:
+            self.task_progress.stage_reads = 0
         self._request_id += 1
         self._turn_id += 1
-        self.messages.append(ContextMessage(
-            role="user", content=user_message, source="user",
-            request_id=self._request_id, turn_id=self._turn_id,
-        ))
+        self.messages.append(
+            ContextMessage(
+                role="user",
+                content=user_message,
+                source="user",
+                request_id=self._request_id,
+                turn_id=self._turn_id,
+            )
+        )
 
         self.transcript.append(
             {
@@ -192,7 +215,7 @@ class AgentSession:
         while True:
             if turns >= self.config.max_turns:
                 return AgentResult(
-                    text="Model turn limit reached.",
+                    text=self.task_progress.stopped_message(),
                     status="max_turns",
                     transcript=copy.deepcopy(self.transcript),
                 )
@@ -204,13 +227,47 @@ class AgentSession:
                     transcript=copy.deepcopy(self.transcript),
                 )
 
+            # 每次主模型调用前恰好轮询一次；先注入再压缩，当前请求的新指令会被保留。
+            if self.config.user is not None:
+                pending = self.config.user.pending_message()
+                if pending is not None:
+                    self._turn_id += 1
+                    self.messages.append(
+                        ContextMessage(
+                            role="user",
+                            content=pending,
+                            source="user",
+                            request_id=self._request_id,
+                            turn_id=self._turn_id,
+                        )
+                    )
+                    self.transcript.append({"type": "user", "content": pending})
+
+            # 每轮重建进度说明，旧版本不进入摘要；编号 -1 专用于此临时系统消息。
+            self.messages = [m for m in self.messages if m.turn_id != -1]
+            if self.task_progress.tool_count or turns == self.config.max_turns - 1:
+                self.messages.insert(
+                    1,
+                    ContextMessage(
+                        role="system",
+                        content=self.task_progress.instruction(
+                            self.config.max_turns - turns
+                        ),
+                        source="system",
+                        request_id=0,
+                        turn_id=-1,
+                    ),
+                )
+
             from cs329z_hw1.agent.compaction import compact_context
 
             self.messages = compact_context(
                 self.messages,
                 request_id=self._request_id,
                 budget=self.config.context_budget,
-                aux_lm=self.config.aux_lm if self.config.aux_lm is not None else self.lm,
+                aux_lm=self.config.aux_lm
+                if self.config.aux_lm is not None
+                else self.lm,
             )
             cur_messages = [m.to_lm_message() for m in self.messages]
             # 本轮助手回复与后续工具结果或错误反馈使用同一个 turn_id。
@@ -235,10 +292,15 @@ class AgentSession:
                 parsed = run_parse_response(reply)
                 parse_error = parsed.error
 
-            self.messages.append(ContextMessage(
-                role="assistant", content=reply, source="agent",
-                request_id=self._request_id, turn_id=self._turn_id,
-            ))
+            self.messages.append(
+                ContextMessage(
+                    role="assistant",
+                    content=reply,
+                    source="agent",
+                    request_id=self._request_id,
+                    turn_id=self._turn_id,
+                )
+            )
             self.transcript.append(
                 {
                     "type": "assistant",
@@ -252,10 +314,15 @@ class AgentSession:
 
                 error_text = f"Tool call error: {parse_error}"
 
-                self.messages.append(ContextMessage(
-                    role="user", content=error_text, source="error",
-                    request_id=self._request_id, turn_id=self._turn_id,
-                ))
+                self.messages.append(
+                    ContextMessage(
+                        role="user",
+                        content=error_text,
+                        source="error",
+                        request_id=self._request_id,
+                        turn_id=self._turn_id,
+                    )
+                )
 
                 self.transcript.append(
                     {
@@ -294,14 +361,28 @@ class AgentSession:
             )
 
             # 先记录调用参数快照，再执行工具，防止工具修改参数影响旧日志。
-            tool_result = self.registry.execute(call.name, call.args)
+            started = time.monotonic()
+            self._notify_progress("tool_call", name=call.name, args=call.args)
+            tool_result = self._execute_with_approval(call)
+            self.task_progress.record(call, tool_result)
+            self._notify_progress(
+                "tool_result",
+                name=call.name,
+                status=tool_result.status,
+                content=tool_result.content,
+                elapsed=time.monotonic() - started,
+            )
 
             # 巨大结果先限长，再写入日志；历史压缩不能代替单条结果的长度控制。
             limit = max(256, self.config.context_budget // 6 * 4)
             if len(tool_result.content) > limit:
                 note = "\n[tool output truncated]\n"
                 room = limit - len(note)
-                tool_result.content = tool_result.content[:room // 2] + note + tool_result.content[-(room - room // 2):]
+                tool_result.content = (
+                    tool_result.content[: room // 2]
+                    + note
+                    + tool_result.content[-(room - room // 2) :]
+                )
 
             self.transcript.append(
                 {
@@ -313,13 +394,15 @@ class AgentSession:
             )
 
             # 将结果状态和内容反馈给模型；使用 user 角色以符合 LM 接口。
-            self.messages.append(ContextMessage(
-                role="user",
-                content=f"Tool {call.name} ({tool_result.status}): {tool_result.content}",
-                source="tool_result",
-                request_id=self._request_id,
-                turn_id=self._turn_id,
-            ))
+            self.messages.append(
+                ContextMessage(
+                    role="user",
+                    content=f"Tool {call.name} ({tool_result.status}): {tool_result.content}",
+                    source="tool_result",
+                    request_id=self._request_id,
+                    turn_id=self._turn_id,
+                )
+            )
 
             # 未知工具和无效参数算格式错误；工具执行失败或被拒绝会重置连续错误次数。
             if tool_result.status in {
@@ -339,6 +422,46 @@ class AgentSession:
                 )
 
             # 工具结果已进入上下文，下一轮由模型决定继续调用还是回答。
+
+    def _notify_progress(self, event_type, **details):
+        """进度通知与执行逻辑解耦；界面异常不能改变工具执行结果。"""
+        if self.on_progress is not None:
+            try:
+                self.on_progress(copy.deepcopy({"type": event_type, **details}))
+            except Exception:
+                logging.getLogger(__name__).exception("Progress callback failed.")
+
+    def _execute_with_approval(self, call: ToolCall) -> ToolResult:
+        """先校验再审批；拒绝调用也作为普通观察结果反馈给模型。"""
+        invalid = self.registry.validate(call.name, call.args)
+        if invalid is not None:
+            return invalid
+
+        tool = self.registry.tools[call.name]
+        # 只读工具及三个内部交互/记忆工具免审批；auto 模式从不请求审批。
+        needs_approval = (
+            self.config.mode == "confirm"
+            and not tool.read_only
+            and call.name not in {"ask_user", "remember", "recall"}
+        )
+        if needs_approval:
+            self._notify_progress("approval_pending", name=call.name)
+            if self.config.user is None:
+                # 没有审批接口时不能默认为批准，避免绕过 confirm 模式。
+                return ToolResult(
+                    status="denied",
+                    content="Approval is required, but no user interface is configured.",
+                )
+            # 审批方获得独立参数副本，不能改写随后实际执行的调用。
+            approval = self.config.user.approve(copy.deepcopy(call))
+            if not approval.approved:
+                return ToolResult(
+                    status="denied",
+                    content=approval.reason.strip() or "The user declined this action.",
+                )
+
+        self._notify_progress("tool_running", name=call.name)
+        return self.registry.execute(call.name, call.args)
 
     def build_optional_tools(self, config: AgentConfig) -> list[ToolSpec]:
         """显式工具列表仅按配置追加交互及记忆工具。"""
@@ -397,7 +520,9 @@ class AgentSession:
                 }
                 for email in store.search(query, k)
             ]
-            return json.dumps(results, ensure_ascii=False)
+            return bounded_search_results(
+                results, max(256, config.context_budget // 6 * 4)
+            )
 
         def read_email(email_id: str) -> str:
             store.ensure_data_loaded()
@@ -414,13 +539,16 @@ class AgentSession:
             return run_daily_digest(emails, aux_lm)
 
         def search_docs(query: str, k: int = 5) -> str:
-            return json.dumps(doc_store.search(query, k), ensure_ascii=False)
+            return bounded_search_results(
+                doc_store.search(query, k), max(256, config.context_budget // 6 * 4)
+            )
 
         def read_doc(doc_id: str, start_line: int = 1) -> str:
             return json.dumps(doc_store.read(doc_id, start_line), ensure_ascii=False)
 
         def run_terminal(cmd: str) -> str:
             from cs329z_hw1.agent.terminal import execute_terminal
+
             return execute_terminal(
                 cmd,
                 workspace=config.workspace,
@@ -443,7 +571,7 @@ class AgentSession:
         return [
             cardinal_spec(
                 "search_emails",
-                "Search archived emails by keywords; returns IDs and snippets. Use read_email for full content.",
+                "Search archived emails using English keywords (translate non-English queries first); returns IDs and snippets. Use read_email for full content.",
                 search_emails,
             ),
             cardinal_spec(
@@ -461,7 +589,7 @@ class AgentSession:
             ),
             cardinal_spec(
                 "search_docs",
-                "Search company documents for policy or product information.",
+                "Search English company documents for policy or product information. Translate non-English queries to English. For staff and leadership, try org chart or leadership. No matches do not mean the corpus is empty.",
                 search_docs,
             ),
             cardinal_spec(
@@ -475,10 +603,14 @@ class AgentSession:
                 run_terminal,
             ),
             cardinal_spec(
-                "remember", "Store a durable user fact or preference for future sessions. Preserve exact details.", remember
+                "remember",
+                "Store a durable user fact or preference for future sessions. Preserve exact details.",
+                remember,
             ),
             cardinal_spec(
-                "recall", "Search saved user facts and preferences by keywords. Recall relevant context before answering personalized questions.", recall
+                "recall",
+                "Search saved user facts and preferences by keywords. Recall relevant context before answering personalized questions.",
+                recall,
             ),
             cardinal_spec(
                 "ask_user", "Ask the user a clarification question.", ask_user
