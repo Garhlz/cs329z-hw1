@@ -179,16 +179,16 @@ class AgentSession:
 
     def send(self, user_message: str) -> AgentResult:
         """延续当前对话；返回本次停止原因及完整日志的独立快照。"""
+        self._request_id += 1
         # 简单“继续”延续调查清单；新问题启动新阶段，避免不同任务互相污染。
         if user_message.strip().lower().rstrip("?!？。") not in {
             "继续",
             "continue",
             "go on",
         }:
-            self.task_progress = TaskProgress()
+            self.task_progress = TaskProgress(task_id=self._request_id)
         else:
             self.task_progress.stage_reads = 0
-        self._request_id += 1
         self._turn_id += 1
         self.messages.append(
             ContextMessage(
@@ -252,7 +252,8 @@ class AgentSession:
                     ContextMessage(
                         role="system",
                         content=self.task_progress.instruction(
-                            self.config.max_turns - turns
+                            self.config.max_turns - turns,
+                            max_chars=max(256, min(2400, self.config.context_budget // 8 * 4)),
                         ),
                         source="system",
                         request_id=0,
@@ -266,9 +267,9 @@ class AgentSession:
                 self.messages,
                 request_id=self._request_id,
                 budget=self.config.context_budget,
-                aux_lm=self.config.aux_lm
-                if self.config.aux_lm is not None
-                else self.lm,
+                aux_lm=(
+                    self.config.aux_lm if self.config.aux_lm is not None else self.lm
+                ),
             )
             cur_messages = [m.to_lm_message() for m in self.messages]
             # 本轮助手回复与后续工具结果或错误反馈使用同一个 turn_id。
@@ -362,10 +363,10 @@ class AgentSession:
             )
 
             # 先记录调用参数快照，再执行工具，防止工具修改参数影响旧日志。
+            recorded_call = copy.deepcopy(call)
             started = time.monotonic()
             self._notify_progress("tool_call", name=call.name, args=call.args)
             tool_result = self._execute_with_approval(call)
-            self.task_progress.record(call, tool_result)
             self._notify_progress(
                 "tool_result",
                 name=call.name,
@@ -375,6 +376,7 @@ class AgentSession:
             )
 
             # 巨大结果先限长，再写入日志；历史压缩不能代替单条结果的长度控制。
+            full_content = tool_result.content
             limit = max(256, self.config.context_budget // 6 * 4)
             if len(tool_result.content) > limit:
                 note = "\n[tool output truncated]\n"
@@ -385,20 +387,26 @@ class AgentSession:
                     + tool_result.content[-(room - room // 2) :]
                 )
 
+            # 完整工具返回值与模型可见版本分别保存；窗口行号来自实际返回值。
+            evidence_id = self.task_progress.record(
+                recorded_call, tool_result, full_content=full_content
+            )
             self.transcript.append(
                 {
                     "type": "tool_result",
                     "name": call.name,
                     "status": tool_result.status,
                     "content": tool_result.content,
+                    "evidence_id": evidence_id,
                 }
             )
 
             # 将结果状态和内容反馈给模型；使用 user 角色以符合 LM 接口。
+            evidence_label = f"Evidence {evidence_id}\n" if evidence_id else ""
             self.messages.append(
                 ContextMessage(
                     role="user",
-                    content=f"Tool {call.name} ({tool_result.status}): {tool_result.content}",
+                    content=f"Tool {call.name} ({tool_result.status}): {evidence_label}{tool_result.content}",
                     source="tool_result",
                     request_id=self._request_id,
                     turn_id=self._turn_id,
