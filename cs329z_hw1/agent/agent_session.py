@@ -93,6 +93,7 @@ from cs329z_hw1.agent.task_progress import TaskProgress, bounded_search_results
 
 import copy
 import logging
+import re
 import time
 from cs329z_hw1.agent.context import ContextMessage
 from cs329z_hw1.agent.memory import FactMemory
@@ -432,10 +433,20 @@ class AgentSession:
                 logging.getLogger(__name__).exception("Progress callback failed.")
 
     def _execute_with_approval(self, call: ToolCall) -> ToolResult:
-        """先校验再审批；拒绝调用也作为普通观察结果反馈给模型。"""
+        """依次校验参数、检查拒绝规则、审批和执行；拒绝结果反馈给模型。"""
         invalid = self.registry.validate(call.name, call.args)
         if invalid is not None:
             return invalid
+
+        # 两种模式均强制执行规则；命中时不送审，也不执行工具。
+        if call.name == "run_terminal":
+            cmd = call.args["cmd"]
+            for rule in self.config.deny_rules:
+                if re.search(rule, cmd):
+                    return ToolResult(
+                        status="denied",
+                        content=f"Command denied by rule {rule!r}.",
+                    )
 
         tool = self.registry.tools[call.name]
         # 只读工具及三个内部交互/记忆工具免审批；auto 模式从不请求审批。
