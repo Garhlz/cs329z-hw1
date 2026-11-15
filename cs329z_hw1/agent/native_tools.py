@@ -5,6 +5,8 @@ import json
 
 from cs329z_hw1.agent.tool_protocol import (
     SECURITY_INSTRUCTION,
+    TASK_INSTRUCTION,
+    capability_instructions,
     format_tool_call,
     parse_response,
 )
@@ -14,7 +16,7 @@ from cs329z_hw1.types import ToolCall
 NATIVE_INSTRUCTION = """Use the provided native function tools when needed.
 Do not write XML, DSML, or textual tool-call blocks. For final answers use plain text.
 Use English search keywords for English corpora; reply in the user's requested language.
-""" + "\n" + SECURITY_INSTRUCTION
+""" + "\n" + SECURITY_INSTRUCTION + "\n" + TASK_INSTRUCTION
 
 
 class NativeToolLM(LM):
@@ -39,7 +41,12 @@ class NativeToolLM(LM):
             message = messages[index]
             # 第一条系统消息原本是文本协议工具说明，原生路径改由 tools 声明。
             if index == 0 and message["role"] == "system":
-                native.append({"role": "system", "content": NATIVE_INSTRUCTION})
+                native.append({
+                    "role": "system",
+                    "content": NATIVE_INSTRUCTION + "\n" + capability_instructions(
+                        {tool["function"]["name"] for tool in self.tools}
+                    ),
+                })
                 index += 1
                 continue
             if message["role"] == "assistant":

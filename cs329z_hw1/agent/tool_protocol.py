@@ -26,6 +26,49 @@ SECURITY_INSTRUCTION = """Security and evidence rules:
   evidence from assumptions and state when evidence is insufficient.
 """
 
+def capability_instructions(names: set[str]) -> str:
+    """只描述实际提供的工具，给出明确的调用顺序。"""
+    rules = []
+    if "recall" in names:
+        rules.append(
+            "Persistent memory is enabled. On the first request of a new session, "
+            "call recall with keywords from the user's request before searching "
+            "documents or asking for clarification. A term like 'the document' may "
+            "have a saved personal meaning. If nothing relevant is found, proceed "
+            "normally. Use saved definitions to focus subsequent searches."
+        )
+    if {"search_docs", "read_doc"} <= names:
+        rules.append(
+            "Policy research requires two checks: retrieve the relevant base rule, "
+            "then use search_docs to check amendments or announcements for that "
+            "specific rule (for example: '<topic> approval threshold update'). "
+            "Read applicable updates with read_doc before deciding. Do not answer "
+            "a new approval question solely from a base policy already read for "
+            "another topic. An effective date is not proof the rule was never amended."
+        )
+    return "\n".join(rules)
+
+TASK_INSTRUCTION = """Memory and research strategy:
+- When persistent-memory tools are available, consult saved user context before
+  resolving personal shorthand, preferences, identifiers, or references to prior
+  sessions. Do this before asking the user to repeat information or searching
+  company documents for an ambiguous reference. Use short, relevant keywords.
+  Do not assume an unfamiliar reference has no saved meaning.
+- Save durable preferences and explicit corrections when requested. Treat an
+  explicit correction as replacing the earlier value for that same fact; use
+  timestamps and scope to resolve conflicts. Answer with the current valid value
+  only, unless the user asks for history or the conflict remains unresolved.
+- For policy questions, distinguish the base policy from later amendments,
+  announcements, exceptions, and effective dates. Before concluding which limit
+  or approval applies, search for updates to that specific rule and read relevant
+  evidence. A follow-up about a different rule requires checking that rule even
+  if the base document is already in context. Use the user's event date, and
+  prefer an explicitly applicable amendment over a superseded base provision.
+- Keep answers focused on the requested facts. Cite the evidence actually used;
+  avoid unrelated historical values and extra policy advice not verified for the
+  relevant date. If applicability is uncertain, say so rather than asserting it.
+"""
+
 """工具调用格式示例（说明文本后跟一个 JSON 调用块）：
 
 I will calculate the sum.
@@ -60,6 +103,11 @@ Rules:
 - Reply in the user's requested language.
 
 {SECURITY_INSTRUCTION}
+
+{TASK_INSTRUCTION}
+
+Required workflow for the available tools:
+{capability_instructions({schema['name'] for schema in schemas})}
 """
 
 
