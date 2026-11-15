@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Cardinal: interactive_chat",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "cs329z_hw1.interactive_chat",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env",
+      "args": ["--mode", "confirm", "--verbose-tools"],
+      "justMyCode": true
+    }
+  ]
+}
